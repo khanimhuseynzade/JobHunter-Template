@@ -1,0 +1,533 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { Job, JobStatus } from "@/types";
+import { getLastSyncLabel } from "@/lib/seed";
+import { isPolandLocation } from "@/lib/location";
+import { isToday } from "@/lib/job-dates";
+import {
+  sortJobList,
+  type JobSortKey,
+  type SortDirection,
+} from "@/lib/job-sort";
+import { JobsTable } from "./JobsTable";
+import { JobCards } from "./JobCards";
+import { SuggestionsPanel, type EmailSuggestion } from "./SuggestionsPanel";
+import { FiltersMenu } from "./FiltersMenu";
+import { Toast } from "./Toast";
+import { statusLabel } from "@/lib/status";
+import { IconMail, IconSearch } from "./icons";
+
+const SORT_KEYS: JobSortKey[] = [
+  "status",
+  "role",
+  "company",
+  "location",
+  "workMode",
+  "latencyDays",
+];
+
+type RangeKey = "7d" | "30d" | "all";
+
+const RANGE_ORDER: RangeKey[] = ["7d", "30d", "all"];
+
+const RANGE_CONFIG: Record<
+  RangeKey,
+  {
+    days: number;
+    rangeLabel: string;
+    toggleLabel: string;
+  }
+> = {
+  "7d": {
+    days: 7,
+    rangeLabel: "last 7 days",
+    toggleLabel: "7d",
+  },
+  "30d": {
+    days: 30,
+    rangeLabel: "last 30 days",
+    toggleLabel: "30d",
+  },
+  // `days: Infinity` makes the cutoff -Infinity, so every job passes the range
+  // filter — an escape hatch for older statused jobs that fall outside 7d/30d.
+  all: {
+    days: Infinity,
+    rangeLabel: "all time",
+    toggleLabel: "All",
+  },
+};
+
+function useDebouncedValue<T>(value: T, delayMs: number): T {
+  const [debounced, setDebounced] = useState(value);
+
+  useEffect(() => {
+    const id = setTimeout(() => setDebounced(value), delayMs);
+    return () => clearTimeout(id);
+  }, [value, delayMs]);
+
+  return debounced;
+}
+
+function filterJobsLocally(jobs: Job[], query: string): Job[] {
+  const needle = query.trim().toLowerCase();
+
+  return jobs.filter((job) => {
+    if (!needle) return true;
+
+    return [job.role, job.company, job.location, job.sourceName].some((field) =>
+      field.toLowerCase().includes(needle)
+    );
+  });
+}
+
+export function JobsView({
+  initialJobs,
+  initialLastSync = null,
+  initialQuery = "",
+  initialShowSkipped = false,
+  initialShowClosed = false,
+}: {
+  initialJobs: Job[];
+  initialLastSync?: string | null;
+  initialQuery?: string;
+  initialShowSkipped?: boolean;
+  initialShowClosed?: boolean;
+}) {
+  const [jobs, setJobs] = useState(initialJobs);
+  const [showSkipped, setShowSkipped] = useState(initialShowSkipped);
+  const [showClosed, setShowClosed] = useState(initialShowClosed);
+  const [query, setQuery] = useState(initialQuery);
+  const [sortKey, setSortKey] = useState<JobSortKey | null>(null);
+  const [sortDir, setSortDir] = useState<SortDirection>("asc");
+  const [lastSync, setLastSync] = useState<string | null>(initialLastSync);
+  const [suggestions, setSuggestions] = useState<EmailSuggestion[]>([]);
+  const [checkingEmail, setCheckingEmail] = useState(false);
+  const [loadingJobs, setLoadingJobs] = useState(false);
+  const [visitedIds, setVisitedIds] = useState<Set<string>>(new Set());
+  const [pressedId, setPressedId] = useState<string | null>(null);
+  const [range, setRange] = useState<RangeKey>("7d");
+  const [polandOnly, setPolandOnly] = useState(false);
+  const [toast, setToast] = useState<{ id: number; message: string } | null>(
+    null
+  );
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showToast = useCallback((message: string) => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    const id = Date.now();
+    setToast({ id, message });
+    toastTimer.current = setTimeout(() => {
+      setToast((current) => (current?.id === id ? null : current));
+    }, 3000);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (toastTimer.current) clearTimeout(toastTimer.current);
+    };
+  }, []);
+
+  // Clear the pressed-row highlight on any pointer press. A row click fires
+  // mousedown (clears) before its click handler (re-sets pressedId), so
+  // clicking a row keeps it highlighted while clicking anywhere else resets it.
+  useEffect(() => {
+    function handlePointerDown() {
+      setPressedId(null);
+    }
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => document.removeEventListener("mousedown", handlePointerDown);
+  }, []);
+
+  const debouncedQuery = useDebouncedValue(query, 300);
+
+  // Serialize the current filter state into the query string used for
+  // /api/jobs. Kept in one place so the "did the filters change?" check and
+  // the actual fetch always agree.
+  const buildJobsParams = useCallback(() => {
+    const params = new URLSearchParams();
+    if (showSkipped) params.set("showSkipped", "true");
+    // Always pull closed listings into memory; whether they're shown is decided
+    // client-side per range (see rangedJobs), so the "Show closed" toggle no
+    // longer drives the fetch and switching it never triggers a refetch.
+    params.set("showClosed", "true");
+    if (debouncedQuery) params.set("q", debouncedQuery);
+    return params.toString();
+  }, [showSkipped, debouncedQuery]);
+
+  const loadJobs = useCallback(async () => {
+    const qs = buildJobsParams();
+    setLoadingJobs(true);
+    try {
+      const jobsRes = await fetch(`/api/jobs?${qs}`);
+      const data = await jobsRes.json();
+      setJobs(data);
+    } finally {
+      setLoadingJobs(false);
+    }
+  }, [buildJobsParams]);
+
+  // Sort is client-only (the server sends a pre-sorted default list), so we
+  // restore it from the URL here. Query/filters are seeded from server props
+  // (see JobsPage) to keep the initial count consistent and avoid a refetch.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const sort = params.get("sort");
+    const dir = params.get("dir");
+
+    if (sort && (SORT_KEYS as string[]).includes(sort)) {
+      setSortKey(sort as JobSortKey);
+    }
+    if (dir === "asc" || dir === "desc") setSortDir(dir);
+  }, []);
+
+  useEffect(() => {
+    const params = new URLSearchParams();
+    if (debouncedQuery) params.set("q", debouncedQuery);
+    if (sortKey) {
+      params.set("sort", sortKey);
+      params.set("dir", sortDir);
+    }
+    if (showSkipped) params.set("showSkipped", "true");
+    if (showClosed) params.set("showClosed", "true");
+
+    const qs = params.toString();
+    const nextUrl = qs ? `${window.location.pathname}?${qs}` : window.location.pathname;
+    window.history.replaceState(null, "", nextUrl);
+  }, [debouncedQuery, sortKey, sortDir, showSkipped, showClosed]);
+
+  // `lastSync` is seeded from the server (see JobsPage) so the "Last updated"
+  // label is correct on first paint and never flips on mount. We only fetch
+  // suggestions and restore locally-stored visited rows here.
+  useEffect(() => {
+    fetch("/api/suggestions")
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (Array.isArray(data)) {
+          setSuggestions(
+            [...data].sort((a, b) => b.confidence - a.confidence)
+          );
+        }
+      })
+      .catch(() => {});
+
+    try {
+      const raw = window.localStorage.getItem("jobhunter:visitedIds");
+      if (raw) setVisitedIds(new Set(JSON.parse(raw)));
+    } catch {}
+  }, []);
+
+  function handleRowOpen(id: string) {
+    setPressedId(id);
+    setVisitedIds((prev) => {
+      if (prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.add(id);
+      try {
+        window.localStorage.setItem(
+          "jobhunter:visitedIds",
+          JSON.stringify([...next])
+        );
+      } catch {}
+      return next;
+    });
+  }
+
+  // The server already rendered `initialJobs` for the initial filter state, so
+  // seed the "last fetched" params with those. We only refetch when the filters
+  // actually change from what the server sent. This avoids the post-mount
+  // refetch that flickered the job count — and is StrictMode-safe (unlike a
+  // one-shot "skip first run" ref, which the double-invoked effect defeats).
+  const lastFetchedParams = useRef<string | null>(null);
+  if (lastFetchedParams.current === null) {
+    const params = new URLSearchParams();
+    if (initialShowSkipped) params.set("showSkipped", "true");
+    // Matches buildJobsParams: the server already sent closed listings.
+    params.set("showClosed", "true");
+    if (initialQuery) params.set("q", initialQuery);
+    lastFetchedParams.current = params.toString();
+  }
+
+  useEffect(() => {
+    const params = buildJobsParams();
+    if (params === lastFetchedParams.current) return;
+    lastFetchedParams.current = params;
+    loadJobs();
+  }, [buildJobsParams, loadJobs]);
+
+  // Jobs scoped to the selected range strictly by firstSeenAt (when a job was
+  // added). Statused jobs (applied / expired / etc.) age out with the window
+  // just like everything else, so the counts reflect the period instead of
+  // accumulating every acted-on job forever. Shared by the stats card and the
+  // table/cards below so the whole view reflects the range.
+  const rangedJobs = useMemo(() => {
+    const { days } = RANGE_CONFIG[range];
+    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+    // Two flavors of "closed":
+    //   • possiblyClosed = missing from a recent sync but may still come back.
+    //   • definitelyClosed = past the deletion threshold, closed for good. The
+    //     only survivors on the client are statused jobs (no-status ones are
+    //     pruned at sync time).
+    // The "All" tab (and the "Show closed" filter) reveals the transient
+    // possiblyClosed listings — dimmed with a badge, until a sync deletes them.
+    // A definitelyClosed listing is hidden ONLY when it has no manual status;
+    // anything you've acted on (applied / expired / etc.) stays as a record even
+    // after it closes for good. 7d/30d are left exactly as before: they hide
+    // no-status possiblyClosed listings and still show statused jobs in-window.
+    const revealClosed = range === "all" || showClosed;
+    return jobs.filter((job) => {
+      if (new Date(job.firstSeenAt).getTime() < cutoff) return false;
+      if (revealClosed) return !(job.definitelyClosed && job.status === null);
+      return !(job.possiblyClosed && job.status === null);
+    });
+  }, [jobs, range, showClosed]);
+
+  // Jobs scoped to the range plus the "Poland only" toggle. Stats, the search
+  // results, and the "of N" count all derive from this so the header numbers
+  // update when Poland-only is switched on.
+  const scopedJobs = useMemo(() => {
+    if (!polandOnly) return rangedJobs;
+    return rangedJobs.filter((job) => isPolandLocation(job.location));
+  }, [rangedJobs, polandOnly]);
+
+  const filteredJobs = useMemo(
+    () => filterJobsLocally(scopedJobs, query),
+    [scopedJobs, query]
+  );
+
+  const visibleJobs = useMemo(() => {
+    if (!sortKey) return filteredJobs;
+    return sortJobList(filteredJobs, sortKey, sortDir);
+  }, [filteredJobs, sortKey, sortDir]);
+
+  // Stats are scoped to the selected range by firstSeenAt (when a job was
+  // first tracked). The Job model has no per-status timestamp, so applied/
+  // rejected counts reflect jobs first seen within the window.
+  const jobStats = useMemo(
+    () => ({
+      total: scopedJobs.length,
+      // "Open" = still actionable: no status yet and not presumed closed.
+      open: scopedJobs.filter(
+        (job) => job.status === null && !job.possiblyClosed
+      ).length,
+      addedToday: scopedJobs.filter((job) => isToday(job.firstSeenAt)).length,
+      applied: scopedJobs.filter((job) => job.status === "applied").length,
+      rejected: scopedJobs.filter((job) => job.status === "rejected").length,
+    }),
+    [scopedJobs]
+  );
+
+  function handleSortChange(key: JobSortKey) {
+    if (sortKey === key) {
+      setSortDir((dir) => (dir === "asc" ? "desc" : "asc"));
+      return;
+    }
+    setSortKey(key);
+    setSortDir("asc");
+  }
+
+  async function handleStatusChange(id: string, status: JobStatus | null) {
+    const res = await fetch("/api/jobs", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, status }),
+    });
+    if (res.ok) {
+      const updated = await res.json();
+      setJobs((prev) => prev.map((j) => (j.id === id ? updated : j)));
+      if (!showSkipped && status === "skipped") {
+        setJobs((prev) => prev.filter((j) => j.id !== id));
+      }
+      showToast(status ? `Marked as ${statusLabel(status)}` : "Status cleared");
+    } else {
+      showToast("Couldn't update status — try again");
+    }
+  }
+
+  async function handleCheckEmail() {
+    setCheckingEmail(true);
+    try {
+      const res = await fetch("/api/check-email", { method: "POST" });
+      const data = await res.json();
+      if (res.ok) {
+        const listRes = await fetch("/api/suggestions");
+        if (listRes.ok) {
+          const list = await listRes.json();
+          if (Array.isArray(list)) {
+            setSuggestions(
+              [...list].sort((a, b) => b.confidence - a.confidence)
+            );
+          }
+        }
+        setLastSync(new Date().toISOString());
+        showToast(
+          data.skipped
+            ? data.skipped
+            : `Checked ${data.messagesNew ?? 0} new email${data.messagesNew === 1 ? "" : "s"} · ${data.suggestionsCreated ?? 0} new suggestion${data.suggestionsCreated === 1 ? "" : "s"}`
+        );
+      } else {
+        showToast(data.error ?? "Email check failed");
+      }
+    } catch {
+      showToast("Email check failed");
+    } finally {
+      setCheckingEmail(false);
+    }
+  }
+
+  function handleSuggestionResolved(
+    id: string,
+    action: "accept" | "dismiss",
+    jobId: string | null,
+    status: JobStatus | null
+  ) {
+    setSuggestions((prev) => prev.filter((s) => s.id !== id));
+    if (action === "accept" && jobId && status) {
+      setJobs((prev) =>
+        prev.map((j) => (j.id === jobId ? { ...j, status } : j))
+      );
+    }
+  }
+
+  return (
+    <div>
+      <div className="mb-8 rounded-2xl border border-gray-200 bg-white">
+        {/* Header stats block — count, range toggle, email button. */}
+        <div className="px-6 py-6">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+            <div className="min-w-0">
+              <p className="text-sm text-gray-500">Open jobs</p>
+              <p className="mt-1 text-5xl font-bold leading-none tracking-tight text-black">
+                {jobStats.open}
+              </p>
+              <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-gray-500">
+                <span>{jobStats.addedToday} added today</span>
+                <span aria-hidden>·</span>
+                <span>{jobStats.applied} applied</span>
+                <span aria-hidden>·</span>
+                <span>{jobStats.rejected} rejected</span>
+              </div>
+              <p className="mt-1 text-xs text-gray-400">
+                Last updated:{" "}
+                <span
+                  key={lastSync}
+                  className={`rounded px-1${
+                    lastSync !== initialLastSync ? " animate-flash" : ""
+                  }`}
+                >
+                  {getLastSyncLabel(lastSync)}
+                </span>
+              </p>
+            </div>
+
+            {/* Controls: email button + range toggle. Right-aligned stack on
+                desktop; wraps below the stats on small screens. */}
+            <div className="flex shrink-0 flex-wrap items-center gap-2 sm:flex-col sm:items-end sm:gap-3">
+              <button
+                type="button"
+                onClick={handleCheckEmail}
+                disabled={checkingEmail}
+                className="inline-flex items-center gap-1.5 rounded-full border border-gray-200 bg-white px-4 py-2 text-xs font-medium text-black transition-colors hover:bg-lime-100 disabled:opacity-50"
+              >
+                <IconMail className="h-3.5 w-3.5 text-forest" />
+                {checkingEmail ? "Checking email…" : "Check email"}
+              </button>
+
+              {/* Segmented range toggle (7d / 30d / All) */}
+              <div
+                className="inline-flex rounded-full p-0.5"
+                style={{ backgroundColor: "#eceeed" }}
+                role="tablist"
+                aria-label="Stats range"
+              >
+                {RANGE_ORDER.map((key) => {
+                  const active = range === key;
+                  return (
+                    <button
+                      key={key}
+                      type="button"
+                      role="tab"
+                      aria-selected={active}
+                      onClick={() => setRange(key)}
+                      className="rounded-full px-3 py-1 text-xs font-medium transition-colors"
+                      style={
+                        active
+                          ? {
+                              backgroundColor: "#fff",
+                              boxShadow: "0 1px 2px rgba(0,0,0,0.08)",
+                              color: "#111",
+                            }
+                          : { color: "#6b7280" }
+                      }
+                    >
+                      {RANGE_CONFIG[key].toggleLabel}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <SuggestionsPanel
+        suggestions={suggestions}
+        onResolved={handleSuggestionResolved}
+      />
+
+      <div className="mb-4 flex flex-col divide-y divide-gray-200 rounded-xl border border-gray-200 bg-white sm:flex-row sm:items-stretch sm:divide-x sm:divide-y-0">
+        <div className="relative w-full sm:flex-1">
+          <IconSearch className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-400" />
+          <input
+            type="search"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search role, company, location…"
+            className="w-full bg-transparent py-2.5 pl-10 pr-3 text-sm text-black placeholder:text-gray-400"
+          />
+        </div>
+        <FiltersMenu
+          showSkipped={showSkipped}
+          onShowSkippedChange={setShowSkipped}
+          showClosed={showClosed}
+          onShowClosedChange={setShowClosed}
+          polandOnly={polandOnly}
+          onPolandOnlyChange={setPolandOnly}
+        />
+      </div>
+
+      <p className="mb-2 text-xs text-gray-500">
+        Showing {visibleJobs.length} of {scopedJobs.length}
+      </p>
+
+      <div
+        className={`transition-opacity duration-200 ${loadingJobs ? "opacity-50" : ""}`}
+      >
+        <div className="hidden md:block">
+          <JobsTable
+            jobs={visibleJobs}
+            sortKey={sortKey}
+            sortDir={sortDir}
+            onSortChange={handleSortChange}
+            onStatusChange={handleStatusChange}
+            visitedIds={visitedIds}
+            pressedId={pressedId}
+            onRowOpen={handleRowOpen}
+          />
+        </div>
+
+        <div className="md:hidden">
+          <JobCards
+            jobs={visibleJobs}
+            onStatusChange={handleStatusChange}
+            visitedIds={visitedIds}
+            pressedId={pressedId}
+            onRowOpen={handleRowOpen}
+          />
+        </div>
+      </div>
+
+      {toast ? <Toast key={toast.id} message={toast.message} /> : null}
+    </div>
+  );
+}

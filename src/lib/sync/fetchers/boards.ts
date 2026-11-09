@@ -1,0 +1,413 @@
+import type { SyncJobInput } from "../types";
+import { justJoinItCategories } from "../../../../config/boards";
+import {
+  fetchJson,
+  fetchText,
+  locationFromParts,
+  parseIsoDate,
+  parseRssItems,
+  parseXmlBlocks,
+  toBoardJob,
+  workModeFromText,
+  xmlElementText,
+} from "./board-utils";
+import {
+  formatLocation,
+  inferWorkMode,
+  isWithinMaxAge,
+  matchesRole,
+} from "../match";
+
+interface NfjPosting {
+  id: string;
+  title: string;
+  name: string;
+  posted: number;
+  location?: {
+    fullyRemote?: boolean;
+    hybridDesc?: string;
+    places?: Array<{ city?: string; country?: { name?: string } }>;
+  };
+  url?: string;
+}
+
+interface NfjResponse {
+  postings: NfjPosting[];
+}
+
+interface JjitOffer {
+  guid: string;
+  slug: string;
+  title: string;
+  workplaceType?: string;
+  city?: string;
+  companyName?: string;
+  publishedAt?: string;
+  locations?: Array<{ city?: string }>;
+}
+
+interface JjitResponse {
+  data: JjitOffer[];
+  meta: {
+    totalItems: number;
+    next?: { cursor?: number | null };
+  };
+}
+
+interface RemoteOkJob {
+  id?: string;
+  slug?: string;
+  epoch?: number;
+  date?: string;
+  position?: string;
+  company?: string;
+  location?: string;
+  url?: string;
+}
+
+interface JobicyJob {
+  id: number;
+  url: string;
+  jobTitle: string;
+  companyName: string;
+  jobGeo: string;
+  jobType?: string;
+  pubDate?: string;
+}
+
+interface JobicyResponse {
+  jobs?: JobicyJob[];
+}
+
+function nfjGroupKey(posting: NfjPosting): string {
+  return `${posting.title}\u0000${posting.name}\u0000${posting.posted}`;
+}
+
+function nfjExternalKey(posting: NfjPosting): string {
+  const slug = `${posting.title}-${posting.name}-${posting.posted}`
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+  return `board:nfj:${slug}`;
+}
+
+/** JJIT appends a random 8-char hash to slugs for reposted listings. */
+function jjitSlugBase(slug: string): string {
+  return slug.replace(/-[a-f0-9]{8}$/i, "");
+}
+
+export async function fetchNoFluffJobs(): Promise<SyncJobInput[]> {
+  const data = await fetchJson<NfjResponse>(
+    "https://nofluffjobs.com/api/posting?limit=12000"
+  );
+  const byGroup = new Map<string, NfjPosting[]>();
+
+  for (const posting of data.postings ?? []) {
+    if (!matchesRole(posting.title)) continue;
+
+    const postedDate = new Date(posting.posted).toISOString();
+    if (!isWithinMaxAge(postedDate, "No Fluff Jobs")) continue;
+
+    const groupKey = nfjGroupKey(posting);
+    const group = byGroup.get(groupKey) ?? [];
+    group.push(posting);
+    byGroup.set(groupKey, group);
+  }
+
+  const results: SyncJobInput[] = [];
+
+  for (const [, group] of byGroup) {
+    const primary =
+      group.find((posting) => posting.location?.fullyRemote) ?? group[0];
+
+    const cities: string[] = [];
+    const countries: string[] = [];
+    let fullyRemote = false;
+    let hybridDesc: string | undefined;
+
+    for (const posting of group) {
+      if (posting.location?.fullyRemote) fullyRemote = true;
+      if (posting.location?.hybridDesc?.trim()) {
+        hybridDesc = posting.location.hybridDesc;
+      }
+      for (const place of posting.location?.places ?? []) {
+        if (place.city) cities.push(place.city);
+        if (place.country?.name) countries.push(place.country.name);
+      }
+    }
+
+    const location = formatLocation([
+      fullyRemote ? "Remote" : "",
+      ...cities,
+      ...countries,
+    ]);
+
+    const workMode = inferWorkMode({
+      fullyRemote,
+      hybridDesc,
+      locationText: location,
+    });
+
+    const slug = primary.url ?? primary.id;
+    results.push({
+      externalKey: nfjExternalKey(primary),
+      role: primary.title,
+      company: primary.name,
+      location,
+      workMode,
+      postedDate: new Date(primary.posted).toISOString(),
+      latencyDays: null,
+      sourceType: "board",
+      sourceName: "No Fluff Jobs",
+      applyUrl: `https://nofluffjobs.com/job/${slug}`,
+    });
+  }
+
+  return results;
+}
+
+const JJIT_CATEGORIES = justJoinItCategories;
+
+async function fetchJustJoinItCategory(
+  category: string,
+  bySlug: Map<string, { offer: JjitOffer; postedAt: string | null }>
+): Promise<void> {
+  let from = 0;
+  let totalItems = Infinity;
+
+  while (from < totalItems) {
+    const url = new URL("https://justjoin.it/api/candidate-api/offers");
+    url.searchParams.set("sortBy", "publishedAt");
+    url.searchParams.set("orderBy", "descending");
+    url.searchParams.set("categories", category);
+    url.searchParams.set("from", String(from));
+
+    const page = await fetchJson<JjitResponse>(url.toString());
+    totalItems = page.meta.totalItems ?? 0;
+
+    const batch = page.data ?? [];
+    if (batch.length === 0) break;
+
+    let outsideAgeCount = 0;
+
+    for (const offer of batch) {
+      const postedDate = parseIsoDate(offer.publishedAt);
+      if (!isWithinMaxAge(postedDate, "Just Join IT")) {
+        outsideAgeCount++;
+        continue;
+      }
+      if (!matchesRole(offer.title)) continue;
+
+      const slugBase = jjitSlugBase(offer.slug);
+      const existing = bySlug.get(slugBase);
+      if (
+        existing &&
+        existing.postedAt &&
+        postedDate &&
+        existing.postedAt >= postedDate
+      ) {
+        continue;
+      }
+
+      bySlug.set(slugBase, { offer, postedAt: postedDate });
+    }
+
+    // Sorted by publishedAt desc — stop when a full page is outside maxAge.
+    if (outsideAgeCount === batch.length) break;
+
+    const nextCursor = page.meta.next?.cursor;
+    if (nextCursor == null || nextCursor === from) break;
+    from = nextCursor;
+  }
+}
+
+export async function fetchJustJoinIt(): Promise<SyncJobInput[]> {
+  const bySlug = new Map<string, { offer: JjitOffer; postedAt: string | null }>();
+
+  for (const category of JJIT_CATEGORIES) {
+    await fetchJustJoinItCategory(category, bySlug);
+  }
+
+  const results: SyncJobInput[] = [];
+
+  for (const [slugBase, { offer }] of bySlug) {
+    const postedDate = parseIsoDate(offer.publishedAt);
+    const cities =
+      offer.locations
+        ?.map((place) => place.city)
+        .filter((city): city is string => Boolean(city)) ?? [];
+    const location = locationFromParts([
+      offer.workplaceType === "remote" ? "Remote" : "",
+      offer.city ?? "",
+      ...cities,
+      offer.workplaceType ?? "",
+    ]);
+    const workMode = workModeFromText(
+      location,
+      offer.workplaceType === "remote"
+    );
+
+    const job = toBoardJob({
+      externalKey: `board:jjit:${slugBase}`,
+      role: offer.title,
+      company: offer.companyName ?? "Unknown",
+      location,
+      workMode,
+      postedDate,
+      sourceName: "Just Join IT",
+      applyUrl: `https://justjoin.it/job-offer/${offer.slug}`,
+    });
+    if (job) results.push(job);
+  }
+
+  return results;
+}
+
+export async function fetchBulldogjob(): Promise<SyncJobInput[]> {
+  const xml = await fetchText("https://bulldogjob.com/api/v2/jobs");
+  const results: SyncJobInput[] = [];
+
+  for (const block of parseXmlBlocks(xml, "job")) {
+    const role = xmlElementText(block, "title");
+    const company = xmlElementText(block, "company");
+    const applyUrl = xmlElementText(block, "url");
+    const location = xmlElementText(block, "location");
+    const id = xmlElementText(block, "id");
+
+    const job = toBoardJob({
+      externalKey: `board:bulldogjob:${id || applyUrl}`,
+      role,
+      company: company || "Unknown",
+      location: locationFromParts([location]),
+      workMode: workModeFromText(location),
+      postedDate: null,
+      sourceName: "Bulldogjob",
+      applyUrl,
+    });
+    if (job) results.push(job);
+  }
+
+  return results;
+}
+
+export async function fetchWeWorkRemotely(): Promise<SyncJobInput[]> {
+  const xml = await fetchText(
+    "https://weworkremotely.com/categories/remote-design-jobs.rss"
+  );
+  const results: SyncJobInput[] = [];
+
+  for (const item of parseRssItems(xml)) {
+    const [companyPart, ...titleParts] = item.title.split(":");
+    const company = companyPart?.trim() || "Unknown";
+    const role = titleParts.join(":").trim() || item.title;
+    const postedDate = parseIsoDate(item.pubDate);
+
+    const job = toBoardJob({
+      externalKey: `board:wwr:${item.link}`,
+      role,
+      company,
+      location: "Remote",
+      workMode: "remote",
+      postedDate,
+      sourceName: "We Work Remotely",
+      applyUrl: item.link,
+    });
+    if (job) results.push(job);
+  }
+
+  return results;
+}
+
+export async function fetchJobicy(): Promise<SyncJobInput[]> {
+  const queries = [
+    "https://jobicy.com/api/v2/remote-jobs?count=50&tag=design",
+    "https://jobicy.com/api/v2/remote-jobs?count=50&industry=design-multimedia",
+    "https://jobicy.com/api/v2/remote-jobs?count=50&industry=web-app-design",
+  ];
+  const seen = new Set<string>();
+  const results: SyncJobInput[] = [];
+
+  for (const url of queries) {
+    const data = await fetchJson<JobicyResponse>(url);
+    for (const offer of data.jobs ?? []) {
+      if (seen.has(String(offer.id))) continue;
+      seen.add(String(offer.id));
+
+      const location = locationFromParts([
+        offer.jobGeo ?? "",
+        offer.jobType ?? "",
+      ]);
+      const job = toBoardJob({
+        externalKey: `board:jobicy:${offer.id}`,
+        role: offer.jobTitle,
+        company: offer.companyName ?? "Unknown",
+        location,
+        workMode: workModeFromText(location, true),
+        postedDate: parseIsoDate(offer.pubDate),
+        sourceName: "Jobicy",
+        applyUrl: offer.url,
+      });
+      if (job) results.push(job);
+    }
+  }
+
+  return results;
+}
+
+export async function fetchRemoteOk(): Promise<SyncJobInput[]> {
+  const data = await fetchJson<Array<RemoteOkJob | Record<string, string>>>(
+    "https://remoteok.com/api"
+  );
+  const results: SyncJobInput[] = [];
+
+  for (const entry of data) {
+    if (!entry || typeof entry !== "object" || !("position" in entry)) continue;
+
+    const offer = entry as RemoteOkJob;
+    const role = offer.position ?? "";
+    const postedDate = offer.epoch
+      ? new Date(offer.epoch * 1000).toISOString()
+      : parseIsoDate(offer.date ?? null);
+    const applyUrl =
+      offer.url ??
+      (offer.slug ? `https://remoteok.com/remote-jobs/${offer.slug}` : "");
+    if (!applyUrl) continue;
+
+    const location = locationFromParts([offer.location ?? "Remote"]);
+    const job = toBoardJob({
+      externalKey: `board:remoteok:${offer.id ?? offer.slug ?? applyUrl}`,
+      role,
+      company: offer.company ?? "Unknown",
+      location,
+      workMode: workModeFromText(location, true),
+      postedDate,
+      sourceName: "RemoteOK",
+      applyUrl,
+    });
+    if (job) results.push(job);
+  }
+
+  return results;
+}
+
+export async function fetchEuRemoteJobs(): Promise<SyncJobInput[]> {
+  const xml = await fetchText("https://euremotejobs.com/feed/");
+  const results: SyncJobInput[] = [];
+
+  for (const item of parseRssItems(xml)) {
+    const postedDate = parseIsoDate(item.pubDate);
+    const job = toBoardJob({
+      externalKey: `board:euremotejobs:${item.link}`,
+      role: item.title,
+      company: "Unknown",
+      location: "Remote EU",
+      workMode: "remote",
+      postedDate,
+      sourceName: "EU Remote Jobs",
+      applyUrl: item.link,
+    });
+    if (job) results.push(job);
+  }
+
+  return results;
+}

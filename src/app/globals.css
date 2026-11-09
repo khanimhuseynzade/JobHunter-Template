@@ -1,0 +1,149 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+
+  --color-white: #ffffff;
+  --color-black: #163300;
+  --color-cream: #fafafa;
+
+  /* Neutral gray scale */
+  --color-gray-50: #f4f4f4;
+  --color-gray-100: #e9e9e9;
+  --color-gray-200: #dcdcdc;
+  --color-gray-300: #c4c4c4;
+  --color-gray-400: #9c9c9c;
+  --color-gray-500: #737373;
+  --color-gray-600: #525252;
+  --color-gray-700: #404040;
+  --color-gray-800: #292929;
+  --color-gray-900: #181818;
+
+  /* Brand */
+  --color-forest: #163300;
+  --color-lime: #9fe870;
+  --color-lime-deep: #82c95a;
+  --color-lime-50: #f4fbec;
+  --color-lime-100: #eaf7dc;
+  --color-lime-200: #d2eeb4;
+  --color-lime-text: #1f3d0c;
+
+  /* Secondary accent — category coding only, never decorative alarm */
+  --color-dusty-blue: #6e8ca0;
+  --color-dusty-blue-100: #e4ecf1;
+  --color-dusty-blue-200: #c7d6df;
+  --color-dusty-blue-text: #3e5a6c;
+
+  /* Active process — In progress. Warm ochre, distinct from lime (applied) and dusty-blue (reached out) */
+  --color-ochre: #8a6a32;
+  --color-ochre-100: #f4eee0;
+  --color-ochre-200: #dcc9a0;
+  --color-ochre-text: #5c4a22;
+
+  /* Muted negative — Rejected. Softer and less saturated than --color-red so it reads as final/closed rather than an active error */
+  --color-rose: #7d4d49;
+  --color-rose-100: #f3e6e6;
+  --color-rose-200: #d9bcb8;
+  --color-rose-text: #7d4d49;
+
+  /* Real errors only */
+  --color-red: #b3261e;
+  --color-red-100: #f5e1df;
+  --color-red-200: #e6bcb7;
+}
+
+body {
+  background-color: var(--color-cream);
+  color: var(--color-black);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+@keyframes sheet-up {
+  from {
+    transform: translateY(12px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.animate-sheet-up {
+  animation: sheet-up 220ms ease-out;
+}
+
+@keyframes flash-highlight {
+  from {
+    background-color: var(--color-lime-100);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+
+.animate-flash {
+  animation: flash-highlight 1.5s ease-out;
+}
+
+/* Status chips — honest semantics, no decorative alarm */
+.chip-empty {
+  background-color: var(--color-gray-100);
+  color: var(--color-gray-600);
+  border: 1px solid var(--color-gray-200);
+}
+
+.chip-applied {
+  background-color: var(--color-lime-100);
+  color: var(--color-lime-text);
+  border: 1px solid var(--color-lime-200);
+}
+
+.chip-skipped {
+  background-color: var(--color-gray-100);
+  color: var(--color-gray-500);
+  border: 1px solid var(--color-gray-200);
+}
+
+.chip-reached_out {
+  background-color: var(--color-dusty-blue-100);
+  color: var(--color-dusty-blue-text);
+  border: 1px solid var(--color-dusty-blue-200);
+}
+
+.chip-in_progress {
+  background-color: var(--color-ochre-100);
+  color: var(--color-ochre-text);
+  border: 1px solid var(--color-ochre-200);
+}
+
+.chip-rejected {
+  background-color: var(--color-rose-100);
+  color: var(--color-rose-text);
+  border: 1px solid var(--color-rose-200);
+}
+
+.chip-expired {
+  background-color: var(--color-gray-100);
+  color: var(--color-gray-600);
+  border: 1px solid var(--color-gray-500);
+}
+
+.chip-error {
+  background-color: var(--color-red-100);
+  color: var(--color-red);
+  border: 1px solid var(--color-red-200);
+}
+
+.chip-posted-today {
+  background-color: var(--color-lime-100);
+  color: var(--color-lime-text);
+  border: 1px solid var(--color-lime-200);
+}
+
+.chip-closed {
+  background-color: var(--color-gray-100);
+  color: var(--color-gray-500);
+  border: 1px dashed var(--color-gray-300);
+}
